@@ -23,11 +23,15 @@ struct erofsdump_cfg {
 	unsigned int totalshow;
 	bool show_inode;
 	bool show_extent;
+	bool show_meta;
 	bool show_superblock;
 	bool show_statistics;
 	bool show_subdirectories;
+	bool extract_block;
 	erofs_nid_t nid;
+	u64 block_num;
 	const char *inode_path;
+	const char *extract_path;
 };
 static struct erofsdump_cfg dumpcfg;
 
@@ -121,6 +125,7 @@ static void usage(int argc, char **argv)
 		" -S              show statistic information of the image\n"
 		" -e              show extent info (INODE required)\n"
 		" -s              show information about superblock\n"
+		" -m              show inode meta information (extent info required)\n"
 		" --device=X      specify an extra device to be used together\n"
 		" --ls            show directory contents (INODE required)\n"
 		" --nid=#         show the target inode info of nid #\n"
@@ -139,9 +144,13 @@ static int erofsdump_parse_options_cfg(int argc, char **argv)
 	int opt, err;
 	char *endptr;
 
-	while ((opt = getopt_long(argc, argv, "SVesh",
+	while ((opt = getopt_long(argc, argv, "SVeshm",
 				  long_options, NULL)) != -1) {
 		switch (opt) {
+		case 'm':
+			dumpcfg.show_meta = true;
+			++dumpcfg.totalshow;
+			break;
 		case 'e':
 			dumpcfg.show_extent = true;
 			++dumpcfg.totalshow;
@@ -361,6 +370,72 @@ static int erofsdump_map_blocks(struct erofs_inode *inode,
 	return erofs_map_blocks(inode, map, flags);
 }
 
+static void erofsdump_show_extent_full(struct erofs_inode *vi)
+{
+	erofs_off_t meta_base = Z_EROFS_FULL_INDEX_ALIGN(erofs_iloc(vi) +
+			vi->inode_isize + vi->xattr_isize);
+	unsigned long lcn = (vi->i_size + vi->z_logical_clusterbits - 1) >> vi->z_logical_clusterbits;
+	fprintf(stdout, "%10" PRIu64 "..%10" PRIu64 " | %7" PRIu64 "\n",
+			meta_base, meta_base + (lcn * sizeof(struct z_erofs_lcluster_index)),
+			lcn * sizeof(struct z_erofs_lcluster_index));
+		
+	fprintf(stdout, "There are %lu index blocks\n", lcn);
+	fprintf(stdout, "Index blocks are not compacted\n");
+
+	return;
+}
+
+static void erofsdump_show_extent_compacted(struct erofs_inode *vi)
+{
+	struct erofs_sb_info *sbi = vi->sbi;
+	unsigned long lcn = (vi->i_size + (1 << vi->z_logical_clusterbits) - 1) >> vi->z_logical_clusterbits;
+	unsigned long initial_lcn = lcn;
+	const erofs_off_t ebase = round_up(erofs_iloc(vi) + vi->inode_isize +
+					   vi->xattr_isize, 8) +
+		sizeof(struct z_erofs_map_header);
+	const unsigned int totalidx = BLK_ROUND_UP(sbi, vi->i_size);
+	unsigned int compacted_4b_initial, compacted_2b;
+	unsigned int amortizedshift;
+	erofs_off_t pos;
+
+	compacted_4b_initial = (32 - ebase % 32) / 4;
+	if (compacted_4b_initial == 32 / 4)
+		compacted_4b_initial = 0;
+
+	if ((vi->z_advise & Z_EROFS_ADVISE_COMPACTED_2B) &&
+	    compacted_4b_initial < totalidx)
+		compacted_2b = rounddown(totalidx - compacted_4b_initial, 16);
+	else
+		compacted_2b = 0;
+
+	pos = ebase;
+	if (lcn < compacted_4b_initial) {
+		amortizedshift = 2;
+		goto out;
+	}
+	pos += compacted_4b_initial * 4;
+	lcn -= compacted_4b_initial;
+
+	if (lcn < compacted_2b) {
+		amortizedshift = 1;
+		goto out;
+	}
+	pos += compacted_2b * 2;
+	lcn -= compacted_2b;
+	amortizedshift = 2;
+out:
+	pos += lcn * (1 << amortizedshift);
+	
+	fprintf(stdout, "%10" PRIu64 "..%10" PRIu64 " | %7" PRIu64 "\n",
+			ebase - sizeof(struct z_erofs_map_header), pos,
+			pos - (ebase - sizeof(struct z_erofs_map_header)));
+		
+	fprintf(stdout, "There are %lu index blocks\n", initial_lcn);
+	fprintf(stdout, "Index blocks are compacted\n");
+
+	return;
+}
+
 static void erofsdump_show_fileinfo(bool show_extent)
 {
 	const char *ext_fmt[] = {
@@ -487,6 +562,21 @@ static void erofsdump_show_fileinfo(bool show_extent)
 	}
 	fprintf(stdout, "%s: %d extents found\n",
 		erofs_is_packed_inode(&inode) ? "(packed file)" : path, extent_count);
+
+	if (!dumpcfg.show_meta)
+		return;
+	if (erofs_inode_is_data_compressed(inode.datalayout)) {
+		fprintf(stdout, "   physical offset    |  length\n");
+		
+		if (inode.datalayout == EROFS_INODE_COMPRESSED_FULL) {
+			erofsdump_show_extent_full(&inode);
+		}
+	
+		if (inode.datalayout == EROFS_INODE_COMPRESSED_COMPACT) {
+			erofsdump_show_extent_compacted(&inode);
+		}
+	}
+
 }
 
 static void erofsdump_filesize_distribution(const char *title,
